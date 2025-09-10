@@ -1,46 +1,115 @@
+import { db } from '../db';
+import { ordersTable, orderItemsTable, menuItemsTable, usersTable } from '../db/schema';
 import { type CreateOrderInput, type OrderWithItems } from '../schema';
+import { eq, inArray } from 'drizzle-orm';
 
 export const createOrder = async (input: CreateOrderInput): Promise<OrderWithItems> => {
-    // This is a placeholder declaration! Real code should be implemented here.
-    // The goal of this handler is creating a new order with order items and persisting it in the database.
-    // It should calculate the total amount based on menu item prices and quantities.
-    // It should also update stock quantities for menu items.
-    return Promise.resolve({
-        id: 0, // Placeholder ID
+  try {
+    // First, verify that the user exists
+    const user = await db.select()
+      .from(usersTable)
+      .where(eq(usersTable.id, input.user_id))
+      .execute();
+
+    if (user.length === 0) {
+      throw new Error('User not found');
+    }
+
+    // Get menu items to validate they exist and calculate total
+    const menuItemIds = input.order_items.map(item => item.menu_item_id);
+    const menuItems = await db.select()
+      .from(menuItemsTable)
+      .where(inArray(menuItemsTable.id, menuItemIds))
+      .execute();
+
+    if (menuItems.length !== menuItemIds.length) {
+      throw new Error('One or more menu items not found');
+    }
+
+    // Check stock availability and calculate total amount
+    let totalAmount = 0;
+    const menuItemMap = new Map(menuItems.map(item => [item.id, item]));
+
+    for (const orderItem of input.order_items) {
+      const menuItem = menuItemMap.get(orderItem.menu_item_id);
+      if (!menuItem) {
+        throw new Error(`Menu item with id ${orderItem.menu_item_id} not found`);
+      }
+      
+      if (menuItem.stock_quantity < orderItem.quantity) {
+        throw new Error(`Insufficient stock for menu item: ${menuItem.name}. Available: ${menuItem.stock_quantity}, Requested: ${orderItem.quantity}`);
+      }
+
+      totalAmount += parseFloat(menuItem.price) * orderItem.quantity;
+    }
+
+    // Create the order
+    const orderResult = await db.insert(ordersTable)
+      .values({
         user_id: input.user_id,
-        order_date: new Date(),
-        status: 'pending',
         pickup_or_delivery_time: input.pickup_or_delivery_time,
         remarks: input.remarks,
-        total_amount: 0, // Should be calculated from order items
-        created_at: new Date(),
-        updated_at: new Date(),
-        user: {
-            id: input.user_id,
-            name: 'Test User',
-            contact_number: '1234567890',
-            department: 'IT',
-            role: 'regular',
-            created_at: new Date()
-        },
-        order_items: input.order_items.map((item, index) => ({
-            id: index,
-            order_id: 0,
-            menu_item_id: item.menu_item_id,
-            quantity: item.quantity,
-            price_at_order: 0, // Should be fetched from menu item
-            created_at: new Date(),
-            menu_item: {
-                id: item.menu_item_id,
-                name: 'Test Menu Item',
-                price: 0,
-                description: null,
-                image_url: null,
-                category: 'Food',
-                stock_quantity: 10,
-                created_at: new Date(),
-                updated_at: new Date()
-            }
-        }))
-    } as OrderWithItems);
+        total_amount: totalAmount.toString() // Convert to string for numeric column
+      })
+      .returning()
+      .execute();
+
+    const newOrder = orderResult[0];
+
+    // Create order items and update stock quantities
+    const orderItemsData = [];
+    for (const orderItem of input.order_items) {
+      const menuItem = menuItemMap.get(orderItem.menu_item_id)!;
+      
+      // Insert order item
+      const orderItemResult = await db.insert(orderItemsTable)
+        .values({
+          order_id: newOrder.id,
+          menu_item_id: orderItem.menu_item_id,
+          quantity: orderItem.quantity,
+          price_at_order: menuItem.price // Already a string from db
+        })
+        .returning()
+        .execute();
+
+      orderItemsData.push(orderItemResult[0]);
+
+      // Update stock quantity
+      await db.update(menuItemsTable)
+        .set({
+          stock_quantity: menuItem.stock_quantity - orderItem.quantity,
+          updated_at: new Date()
+        })
+        .where(eq(menuItemsTable.id, orderItem.menu_item_id))
+        .execute();
+    }
+
+    // Get updated menu items for the response
+    const updatedMenuItems = await db.select()
+      .from(menuItemsTable)
+      .where(inArray(menuItemsTable.id, menuItemIds))
+      .execute();
+
+    const updatedMenuItemMap = new Map(updatedMenuItems.map(item => [item.id, item]));
+
+    // Build the response with proper type conversions
+    const orderWithItems: OrderWithItems = {
+      ...newOrder,
+      total_amount: parseFloat(newOrder.total_amount), // Convert back to number
+      user: user[0],
+      order_items: orderItemsData.map(orderItem => ({
+        ...orderItem,
+        price_at_order: parseFloat(orderItem.price_at_order), // Convert back to number
+        menu_item: {
+          ...updatedMenuItemMap.get(orderItem.menu_item_id)!,
+          price: parseFloat(updatedMenuItemMap.get(orderItem.menu_item_id)!.price) // Convert back to number
+        }
+      }))
+    };
+
+    return orderWithItems;
+  } catch (error) {
+    console.error('Order creation failed:', error);
+    throw error;
+  }
 };
